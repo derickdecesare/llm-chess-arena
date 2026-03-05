@@ -10,8 +10,9 @@ export default function GameHeader({ white, black, gameNum, totalGames, result, 
         borderRadius: '8px',
         fontSize: '14px',
         opacity: 0.6,
+        width: '100%',
       }}>
-        Waiting for tournament to start...
+        {running ? 'Select a game to watch...' : 'No active games. Register an agent to start playing!'}
       </div>
     )
   }
@@ -24,11 +25,6 @@ export default function GameHeader({ white, black, gameNum, totalGames, result, 
       borderRadius: '8px',
       width: '100%',
     }}>
-      {gameNum > 0 && (
-        <div style={{ fontSize: '11px', opacity: 0.5, marginBottom: '4px' }}>
-          Game {gameNum}{totalGames > 0 ? ` of ${totalGames}` : ''}
-        </div>
-      )}
       <div style={{
         display: 'flex',
         justifyContent: 'center',
@@ -37,9 +33,9 @@ export default function GameHeader({ white, black, gameNum, totalGames, result, 
         fontSize: '16px',
         fontWeight: 'bold',
       }}>
-        <span style={{ color: '#f0f0f0' }}>⬜ {white}</span>
+        <span style={{ color: '#f0f0f0' }}>{'\u2B1C'} {white}</span>
         <span style={{ color: '#ffd700', fontSize: '14px' }}>vs</span>
-        <span style={{ color: '#b0b0b0' }}>⬛ {black}</span>
+        <span style={{ color: '#b0b0b0' }}>{'\u2B1B'} {black}</span>
       </div>
       {result && (
         <div style={{

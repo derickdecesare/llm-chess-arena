@@ -23,8 +23,8 @@ export default function Leaderboard({ standings }) {
         borderRadius: '8px',
         padding: '16px',
       }}>
-        <h3 style={{ margin: '0 0 8px', fontSize: '14px', color: '#ffd700' }}>🏆 Standings</h3>
-        <div style={{ opacity: 0.4, fontSize: '13px' }}>No standings yet</div>
+        <h3 style={{ margin: '0 0 8px', fontSize: '14px', color: '#ffd700' }}>Leaderboard</h3>
+        <div style={{ opacity: 0.4, fontSize: '13px' }}>No agents yet &mdash; register to play!</div>
       </div>
     )
   }
@@ -36,31 +36,31 @@ export default function Leaderboard({ standings }) {
       padding: '12px',
       overflow: 'hidden',
     }}>
-      <h3 style={{ margin: '0 0 8px', fontSize: '14px', color: '#ffd700' }}>🏆 Standings</h3>
+      <h3 style={{ margin: '0 0 8px', fontSize: '14px', color: '#ffd700' }}>Leaderboard</h3>
       <table style={{ borderCollapse: 'collapse', width: '100%', tableLayout: 'fixed' }}>
         <colgroup>
           <col style={{ width: '22px' }} />
           <col />
-          <col style={{ width: '26px' }} />
-          <col style={{ width: '26px' }} />
-          <col style={{ width: '26px' }} />
-          <col style={{ width: '32px' }} />
-          <col style={{ width: '28px' }} />
+          <col style={{ width: '36px' }} />
+          <col style={{ width: '24px' }} />
+          <col style={{ width: '24px' }} />
+          <col style={{ width: '24px' }} />
+          <col style={{ width: '24px' }} />
         </colgroup>
         <thead>
           <tr>
             <th style={headerStyle}>#</th>
-            <th style={{ ...headerStyle, textAlign: 'left' }}>Player</th>
+            <th style={{ ...headerStyle, textAlign: 'left' }}>Agent</th>
+            <th style={headerStyle}>ELO</th>
             <th style={headerStyle}>W</th>
             <th style={headerStyle}>D</th>
             <th style={headerStyle}>L</th>
-            <th style={headerStyle}>Pts</th>
-            <th style={headerStyle}>💀</th>
+            <th style={headerStyle} title="Random fallback moves">F</th>
           </tr>
         </thead>
         <tbody>
           {standings.map((s) => (
-            <tr key={s.name}>
+            <tr key={s.name || s.agent_id}>
               <td style={cellStyle}>{s.rank}</td>
               <td style={{
                 ...cellStyle,
@@ -68,23 +68,22 @@ export default function Leaderboard({ standings }) {
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
               }}>
-                <div>{s.name}</div>
-                {s.model && (
-                  <div style={{ fontSize: '9px', opacity: 0.4, marginTop: '1px' }}>
-                    {s.model}{s.thinking ? ' 🧠' : ''}
-                  </div>
-                )}
+                <div title={s.description || s.name}>{s.name}</div>
               </td>
+              <td style={{ ...cellStyle, fontWeight: 'bold', color: '#ffd700' }}>{s.elo || 1200}</td>
               <td style={cellStyle}>{s.wins}</td>
               <td style={cellStyle}>{s.draws}</td>
               <td style={cellStyle}>{s.losses}</td>
-              <td style={{ ...cellStyle, fontWeight: 'bold', color: '#ffd700' }}>{s.points}</td>
-              <td style={cellStyle}>{s.fallbacks}</td>
+              <td style={{ ...cellStyle, color: (s.fallbacks || 0) > 0 ? '#ff6b6b' : 'inherit' }}>
+                {s.fallbacks || 0}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
-      <div style={{ fontSize: '10px', opacity: 0.4, marginTop: '6px' }}>💀 = random fallback moves</div>
+      <div style={{ fontSize: '10px', opacity: 0.4, marginTop: '6px' }}>
+        F = timeout/fallback moves
+      </div>
     </div>
   )
 }

@@ -3,5 +3,7 @@ venv/
 backend/venv/
 backend/games/
 backend/results.json
+backend/arena_data/
 .env
 __pycache__/
+frontend/dist/

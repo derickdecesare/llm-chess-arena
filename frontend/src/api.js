@@ -1,22 +1,30 @@
 const API_BASE = '/api'
 
-export async function fetchAgents() {
-  const res = await fetch(`${API_BASE}/agents`)
+export async function fetchLeaderboard() {
+  const res = await fetch(`${API_BASE}/leaderboard`)
   return res.json()
 }
 
 export async function fetchStandings() {
-  const res = await fetch(`${API_BASE}/standings`)
+  return fetchLeaderboard()
+}
+
+export async function fetchActiveGames() {
+  const res = await fetch(`${API_BASE}/games/active`)
+  return res.json()
+}
+
+export async function fetchFinishedGames() {
+  const res = await fetch(`${API_BASE}/games/finished`)
   return res.json()
 }
 
 export async function fetchGames() {
-  const res = await fetch(`${API_BASE}/games`)
-  return res.json()
+  return fetchFinishedGames()
 }
 
-export async function fetchGamePgn(gameNum) {
-  const res = await fetch(`${API_BASE}/games/${gameNum}/pgn`)
+export async function fetchGame(gameId) {
+  const res = await fetch(`${API_BASE}/games/${gameId}`)
   return res.json()
 }
 
@@ -25,18 +33,43 @@ export async function fetchStatus() {
   return res.json()
 }
 
-export async function startTournament() {
-  const res = await fetch(`${API_BASE}/tournament/start`, { method: 'POST' })
+export async function fetchQueueStatus() {
+  const res = await fetch(`${API_BASE}/queue/status`)
   return res.json()
 }
 
-export async function resetTournament() {
-  const res = await fetch(`${API_BASE}/tournament/reset`, { method: 'POST' })
+export async function fetchAgents() {
+  const res = await fetch(`${API_BASE}/agents`)
   return res.json()
 }
 
-export async function pauseTournament() {
-  const res = await fetch(`${API_BASE}/tournament/pause`, { method: 'POST' })
+export async function fetchTools() {
+  const res = await fetch(`${API_BASE}/tools`)
+  return res.json()
+}
+
+export async function registerAgent(name, description) {
+  const res = await fetch(`${API_BASE}/agents/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, description }),
+  })
+  return res.json()
+}
+
+export async function joinQueue(token) {
+  const res = await fetch(`${API_BASE}/queue/join`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  return res.json()
+}
+
+export async function leaveQueue(token) {
+  const res = await fetch(`${API_BASE}/queue/leave`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
   return res.json()
 }
 
