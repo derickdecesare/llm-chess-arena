@@ -1,30 +1,33 @@
-"""Public arena: agent registration, matchmaking, concurrent games."""
+"""Public arena: agent registration, matchmaking, concurrent games.
 
+Fully async — uses SQLite (via aiosqlite) for crash-safe persistence and
+asyncio primitives instead of threading.
+"""
+
+import asyncio
 import json
 import logging
+import random
 import secrets
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Awaitable
 
 import chess
 
+from database import Database, hash_token
 from tools import execute_tool
 
 log = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent / "arena_data"
-GAMES_DIR = Path(__file__).parent / "games"
-AGENTS_FILE = DATA_DIR / "agents.json"
-GAMES_FILE = DATA_DIR / "games.json"
-RATINGS_FILE = DATA_DIR / "ratings.json"
+ABANDON_THRESHOLD = 3
+MAX_TOOL_CALLS = 10
+MOVE_TIMEOUT = 120.0
 
 
 # ---------------------------------------------------------------------------
-# Data models
+# Data models (in-memory representations)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -32,7 +35,7 @@ class RegisteredAgent:
     agent_id: str
     name: str
     description: str
-    token: str
+    token_hash: str
     elo: float = 1200.0
     games_played: int = 0
     wins: int = 0
@@ -54,6 +57,10 @@ class RegisteredAgent:
             "fallbacks": self.fallbacks,
         }
 
+    @classmethod
+    def from_row(cls, row: dict) -> "RegisteredAgent":
+        return cls(**{k: row[k] for k in cls.__dataclass_fields__ if k in row})
+
 
 @dataclass
 class LiveGame:
@@ -64,17 +71,16 @@ class LiveGame:
     black_name: str
     board: chess.Board
     moves: list = field(default_factory=list)
-    status: str = "active"  # active | finished
+    status: str = "active"
     result: Optional[str] = None
     reason: Optional[str] = None
-    turn_agent_id: Optional[str] = None
     turn_deadline: float = 0.0
-    tool_calls_remaining: int = 10
-    max_tool_calls: int = 10
-    move_timeout: float = 120.0
+    tool_calls_remaining: int = MAX_TOOL_CALLS
     created_at: float = 0.0
     white_fallbacks: int = 0
     black_fallbacks: int = 0
+    white_consecutive_timeouts: int = 0
+    black_consecutive_timeouts: int = 0
 
     def current_side(self) -> str:
         return "white" if self.board.turn == chess.WHITE else "black"
@@ -95,13 +101,13 @@ class LiveGame:
             "turn_agent_id": self.current_agent_id(),
             "move_count": len(self.moves),
             "moves": [
-                {"san": m["san"], "uci": m["uci"], "side": m["side"], "agent": m["agent"], "fallback": m.get("fallback", False)}
+                {"san": m["san"], "uci": m["uci"], "side": m["side"],
+                 "agent": m["agent"], "fallback": m.get("fallback", False)}
                 for m in self.moves
             ],
         }
 
     def to_state(self, for_agent_id: str) -> dict:
-        """Board state for the playing agent."""
         side = "white" if self.board.turn == chess.WHITE else "black"
         move_history = []
         replay = chess.Board()
@@ -137,98 +143,153 @@ def _elo_update(ra: float, rb: float, score_a: float, k: int = 32) -> tuple[floa
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter (in-memory, per-key sliding window)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    def __init__(self):
+        self._windows: dict[str, list[float]] = {}
+
+    def check(self, key: str, max_requests: int, window_seconds: float) -> bool:
+        now = time.time()
+        cutoff = now - window_seconds
+        timestamps = self._windows.get(key, [])
+        timestamps = [t for t in timestamps if t > cutoff]
+        if len(timestamps) >= max_requests:
+            return False
+        timestamps.append(now)
+        self._windows[key] = timestamps
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Arena Manager
 # ---------------------------------------------------------------------------
 
 class ArenaManager:
-    def __init__(self):
-        DATA_DIR.mkdir(exist_ok=True)
-        GAMES_DIR.mkdir(exist_ok=True)
+    def __init__(self, db: Database):
+        self.db = db
         self.agents: dict[str, RegisteredAgent] = {}
-        self.tokens: dict[str, str] = {}  # token -> agent_id
-        self.queue: list[str] = []  # agent_ids waiting for a game
+        self.token_hashes: dict[str, str] = {}  # hash -> agent_id
+        self.queue: list[str] = []
         self.games: dict[str, LiveGame] = {}
-        self.finished_games: list[dict] = []
-        self.lock = threading.Lock()
-        self.broadcast_fn: Optional[Callable] = None
-        self._timeout_thread: Optional[threading.Thread] = None
+        self.lock = asyncio.Lock()
+        self.broadcast_fn: Optional[Callable[..., Awaitable]] = None
+        self.agent_ws_clients: dict[str, list] = {}  # agent_id -> [WebSocket]
+        self._timeout_task: Optional[asyncio.Task] = None
         self._running = True
-        self._load()
-        self._start_timeout_monitor()
+        self.rate_limiter = RateLimiter()
+
+    async def initialize(self):
+        """Load state from database and start background tasks."""
+        await self._load_agents()
+        await self._restore_active_games()
+        self._timeout_task = asyncio.create_task(self._timeout_monitor())
+        log.info("Arena initialized: %d agents, %d active games restored",
+                 len(self.agents), len(self.games))
 
     def set_broadcast(self, fn: Callable):
         self.broadcast_fn = fn
 
-    def _broadcast(self, event: dict):
+    async def _broadcast(self, event: dict):
         if self.broadcast_fn:
-            self.broadcast_fn(event)
+            await self.broadcast_fn(event)
 
-    # -- Persistence --
-
-    def _load(self):
-        if AGENTS_FILE.exists():
+    async def _notify_agent(self, agent_id: str, event: dict):
+        """Send an event to a specific agent's WebSocket connections."""
+        clients = self.agent_ws_clients.get(agent_id, [])
+        data = json.dumps(event)
+        disconnected = []
+        for ws in clients:
             try:
-                data = json.loads(AGENTS_FILE.read_text())
-                for d in data:
-                    agent = RegisteredAgent(**d)
-                    self.agents[agent.agent_id] = agent
-                    self.tokens[agent.token] = agent.agent_id
-                log.info("Loaded %d registered agents", len(self.agents))
+                await ws.send_text(data)
             except Exception:
-                log.exception("Failed to load agents")
+                disconnected.append(ws)
+        for ws in disconnected:
+            clients.remove(ws)
 
-        if GAMES_FILE.exists():
+    def register_agent_ws(self, agent_id: str, ws):
+        self.agent_ws_clients.setdefault(agent_id, []).append(ws)
+
+    def unregister_agent_ws(self, agent_id: str, ws):
+        clients = self.agent_ws_clients.get(agent_id, [])
+        if ws in clients:
+            clients.remove(ws)
+
+    # -- Load from DB --
+
+    async def _load_agents(self):
+        rows = await self.db.get_all_agents()
+        for row in rows:
+            agent = RegisteredAgent.from_row(row)
+            self.agents[agent.agent_id] = agent
+            self.token_hashes[agent.token_hash] = agent.agent_id
+        log.info("Loaded %d agents from database", len(self.agents))
+
+    async def _restore_active_games(self):
+        """Rebuild in-memory game state from active games in DB."""
+        rows = await self.db.get_active_games()
+        for row in rows:
             try:
-                self.finished_games = json.loads(GAMES_FILE.read_text())
-                log.info("Loaded %d finished games", len(self.finished_games))
+                board = chess.Board(row["fen"])
+                moves = json.loads(row["moves_json"])
+                game = LiveGame(
+                    game_id=row["game_id"],
+                    white_id=row["white_id"],
+                    black_id=row["black_id"],
+                    white_name=row["white_name"],
+                    black_name=row["black_name"],
+                    board=board,
+                    moves=moves,
+                    status="active",
+                    turn_deadline=time.time() + MOVE_TIMEOUT,
+                    tool_calls_remaining=row["tool_calls_remaining"],
+                    created_at=row["created_at"],
+                    white_fallbacks=row["white_fallbacks"],
+                    black_fallbacks=row["black_fallbacks"],
+                    white_consecutive_timeouts=row.get("white_consecutive_timeouts", 0),
+                    black_consecutive_timeouts=row.get("black_consecutive_timeouts", 0),
+                )
+                self.games[game.game_id] = game
+                log.info("Restored active game: %s (%s vs %s, %d moves)",
+                         game.game_id, game.white_name, game.black_name, len(moves))
             except Exception:
-                log.exception("Failed to load games history")
-
-    def _save_agents(self):
-        data = []
-        for a in self.agents.values():
-            data.append({
-                "agent_id": a.agent_id, "name": a.name, "description": a.description,
-                "token": a.token, "elo": a.elo, "games_played": a.games_played,
-                "wins": a.wins, "draws": a.draws, "losses": a.losses,
-                "fallbacks": a.fallbacks, "created_at": a.created_at,
-            })
-        AGENTS_FILE.write_text(json.dumps(data, indent=2))
-
-    def _save_games(self):
-        GAMES_FILE.write_text(json.dumps(self.finished_games, indent=2))
+                log.exception("Failed to restore game %s", row["game_id"])
 
     # -- Agent registration --
 
-    def register_agent(self, name: str, description: str = "") -> dict:
-        with self.lock:
-            for a in self.agents.values():
-                if a.name.lower() == name.lower():
-                    return {"error": f"Agent name '{name}' already taken"}
+    async def register_agent(self, name: str, description: str = "") -> dict:
+        async with self.lock:
+            existing = await self.db.get_agent_by_name(name)
+            if existing:
+                return {"error": f"Agent name '{name}' already taken"}
 
             agent_id = str(uuid.uuid4())[:8]
-            token = f"arena_{secrets.token_urlsafe(32)}"
+            raw_token = f"arena_{secrets.token_urlsafe(32)}"
+            tok_hash = hash_token(raw_token)
+
             agent = RegisteredAgent(
                 agent_id=agent_id,
                 name=name,
                 description=description,
-                token=token,
+                token_hash=tok_hash,
                 created_at=time.time(),
             )
+            await self.db.insert_agent(agent_id, name, description, tok_hash, agent.created_at)
             self.agents[agent_id] = agent
-            self.tokens[token] = agent_id
-            self._save_agents()
+            self.token_hashes[tok_hash] = agent_id
 
             log.info("Registered agent: %s (%s)", name, agent_id)
             return {
                 "agent_id": agent_id,
                 "name": name,
-                "token": token,
-                "message": "Save your token! You'll need it to authenticate API calls.",
+                "token": raw_token,
+                "message": "Save your token! It won't be shown again.",
             }
 
     def authenticate(self, token: str) -> Optional[str]:
-        return self.tokens.get(token)
+        tok_hash = hash_token(token)
+        return self.token_hashes.get(tok_hash)
 
     def get_agent(self, agent_id: str) -> Optional[RegisteredAgent]:
         return self.agents.get(agent_id)
@@ -238,15 +299,12 @@ class ArenaManager:
             self.agents.values(),
             key=lambda a: (-a.elo, -a.wins, a.name),
         )
-        return [
-            {**a.to_public(), "rank": i + 1}
-            for i, a in enumerate(agents)
-        ]
+        return [{**a.to_public(), "rank": i + 1} for i, a in enumerate(agents)]
 
     # -- Matchmaking --
 
-    def join_queue(self, agent_id: str) -> dict:
-        with self.lock:
+    async def join_queue(self, agent_id: str) -> dict:
+        async with self.lock:
             for g in self.games.values():
                 if g.status == "active" and agent_id in (g.white_id, g.black_id):
                     return {"status": "already_in_game", "game_id": g.game_id}
@@ -259,12 +317,12 @@ class ArenaManager:
             log.info("Agent %s joined queue (position %d)", agent_id, pos)
 
             if len(self.queue) >= 2:
-                return self._create_match()
+                return await self._create_match(agent_id)
 
             return {"status": "queued", "position": pos, "message": "Waiting for opponent..."}
 
-    def leave_queue(self, agent_id: str) -> dict:
-        with self.lock:
+    async def leave_queue(self, agent_id: str) -> dict:
+        async with self.lock:
             if agent_id in self.queue:
                 self.queue.remove(agent_id)
                 return {"status": "left_queue"}
@@ -277,89 +335,120 @@ class ArenaManager:
             "waiting_agents": [self.agents[aid].name for aid in self.queue if aid in self.agents],
         }
 
-    def _create_match(self) -> dict:
+    async def _create_match(self, caller_id: str) -> dict:
         """Create a game from the first two agents in queue. Must hold lock."""
         a_id = self.queue.pop(0)
         b_id = self.queue.pop(0)
         a = self.agents[a_id]
         b = self.agents[b_id]
 
-        import random
         if random.random() < 0.5:
             a_id, b_id = b_id, a_id
             a, b = b, a
 
         game_id = str(uuid.uuid4())[:8]
+        now = time.time()
+        board = chess.Board()
         game = LiveGame(
             game_id=game_id,
             white_id=a_id,
             black_id=b_id,
             white_name=a.name,
             black_name=b.name,
-            board=chess.Board(),
-            created_at=time.time(),
-            turn_deadline=time.time() + 120.0,
+            board=board,
+            created_at=now,
+            turn_deadline=now + MOVE_TIMEOUT,
         )
         self.games[game_id] = game
 
+        await self.db.insert_game(
+            game_id, a_id, b_id, a.name, b.name,
+            board.fen(), game.turn_deadline, now,
+        )
+
         log.info("Match created: %s vs %s (game %s)", a.name, b.name, game_id)
 
-        self._broadcast({
+        game_start_event = {
             "type": "game_start",
             "game_id": game_id,
             "white": {"agent_id": a_id, "name": a.name},
             "black": {"agent_id": b_id, "name": b.name},
-        })
+        }
+        await self._broadcast(game_start_event)
 
+        for pid in (a_id, b_id):
+            side = "white" if pid == a_id else "black"
+            await self._notify_agent(pid, {
+                "type": "matched",
+                "game_id": game_id,
+                "your_side": side,
+                "opponent": b.name if pid == a_id else a.name,
+            })
+
+        caller_side = "white" if caller_id == a_id else "black"
         return {
             "status": "matched",
             "game_id": game_id,
             "white": {"agent_id": a_id, "name": a.name},
             "black": {"agent_id": b_id, "name": b.name},
-            "your_side": "white" if a_id == a_id else "black",
+            "your_side": caller_side,
         }
 
     # -- Game play --
 
     def get_game_state(self, game_id: str, agent_id: str) -> Optional[dict]:
         game = self.games.get(game_id)
-        if not game:
-            for fg in self.finished_games:
-                if fg.get("game_id") == game_id:
-                    return fg
-            return None
-        return game.to_state(agent_id)
+        if game:
+            return game.to_state(agent_id)
+        return None
+
+    async def get_game_state_or_finished(self, game_id: str, agent_id: str) -> Optional[dict]:
+        game = self.games.get(game_id)
+        if game:
+            return game.to_state(agent_id)
+        row = await self.db.get_game(game_id)
+        if row:
+            return self._finished_game_to_public(row)
+        return None
 
     def get_game_public(self, game_id: str) -> Optional[dict]:
         game = self.games.get(game_id)
         if game:
             return game.to_public()
-        for fg in self.finished_games:
-            if fg.get("game_id") == game_id:
-                return fg
+        return None
+
+    async def get_game_public_or_finished(self, game_id: str) -> Optional[dict]:
+        game = self.games.get(game_id)
+        if game:
+            return game.to_public()
+        row = await self.db.get_game(game_id)
+        if row:
+            return self._finished_game_to_public(row)
         return None
 
     def use_tool(self, game_id: str, agent_id: str, tool_name: str, args: dict) -> dict:
-        with self.lock:
-            game = self.games.get(game_id)
-            if not game:
-                return {"error": "Game not found"}
-            if game.status != "active":
-                return {"error": "Game is finished"}
-            if game.current_agent_id() != agent_id:
-                return {"error": "Not your turn"}
-            if tool_name == "make_move":
-                return {"error": "Use POST /api/games/{game_id}/move to submit moves"}
-            if game.tool_calls_remaining <= 0:
-                return {"error": "No tool calls remaining. Submit your move."}
+        game = self.games.get(game_id)
+        if not game:
+            return {"error": "Game not found"}
+        if game.status != "active":
+            return {"error": "Game is finished"}
+        if game.current_agent_id() != agent_id:
+            return {"error": "Not your turn"}
+        if tool_name == "make_move":
+            return {"error": "Use POST /api/games/{game_id}/move to submit moves"}
+        if game.tool_calls_remaining <= 0:
+            return {"error": "No tool calls remaining. Submit your move."}
 
-            game.tool_calls_remaining -= 1
+        game.tool_calls_remaining -= 1
+        try:
             result = execute_tool(game.board, tool_name, args)
-            result["_budget"] = f"{game.tool_calls_remaining} tool calls remaining"
-            return result
+        except Exception as e:
+            return {"error": f"Tool error: {e}"}
+        result["_budget"] = f"{game.tool_calls_remaining} tool calls remaining"
+        return result
 
-    def make_move(self, game_id: str, agent_id: str, uci: str) -> dict:
-        with self.lock:
+    async def make_move(self, game_id: str, agent_id: str, uci: str) -> dict:
+        async with self.lock:
             game = self.games.get(game_id)
             if not game:
                 return {"error": "Game not found"}
@@ -376,15 +465,22 @@ class ArenaManager:
                 try:
                     move = game.board.parse_san(uci)
                 except ValueError:
-                    return {"error": f"Invalid move format: '{uci}'", "legal_moves": [m.uci() for m in game.board.legal_moves]}
+                    return {"error": f"Invalid move format: '{uci}'",
+                            "legal_moves": [m.uci() for m in game.board.legal_moves]}
 
             if move not in game.board.legal_moves:
-                return {"error": f"Illegal move: '{uci}'", "legal_moves": [m.uci() for m in game.board.legal_moves]}
+                return {"error": f"Illegal move: '{uci}'",
+                        "legal_moves": [m.uci() for m in game.board.legal_moves]}
 
             side = game.current_side()
             agent_name = game.white_name if side == "white" else game.black_name
             san = game.board.san(move)
             game.board.push(move)
+
+            if side == "white":
+                game.white_consecutive_timeouts = 0
+            else:
+                game.black_consecutive_timeouts = 0
 
             move_record = {
                 "ply": len(game.moves),
@@ -397,11 +493,10 @@ class ArenaManager:
                 "fen": game.board.fen(),
             }
             game.moves.append(move_record)
+            game.tool_calls_remaining = MAX_TOOL_CALLS
+            game.turn_deadline = time.time() + MOVE_TIMEOUT
 
-            game.tool_calls_remaining = game.max_tool_calls
-            game.turn_deadline = time.time() + game.move_timeout
-
-            self._broadcast({
+            move_event = {
                 "type": "move",
                 "game_id": game_id,
                 "ply": move_record["ply"],
@@ -411,10 +506,25 @@ class ArenaManager:
                 "san": san,
                 "fen": game.board.fen(),
                 "fallback": False,
+            }
+            await self._broadcast(move_event)
+
+            next_agent_id = game.current_agent_id()
+            await self._notify_agent(next_agent_id, {
+                "type": "your_turn",
+                "game_id": game_id,
+                "fen": game.board.fen(),
             })
 
             if game.board.is_game_over() or len(game.moves) >= 300:
-                return self._finish_game(game)
+                return await self._finish_game(game)
+
+            await self.db.update_game_move(
+                game_id, game.board.fen(), json.dumps(game.moves),
+                game.tool_calls_remaining, game.turn_deadline,
+                game.white_fallbacks, game.black_fallbacks,
+                game.white_consecutive_timeouts, game.black_consecutive_timeouts,
+            )
 
             return {
                 "status": "ok",
@@ -423,13 +533,12 @@ class ArenaManager:
                 "game_status": "active",
             }
 
-    def _apply_timeout_move(self, game: LiveGame):
+    async def _apply_timeout_move(self, game: LiveGame):
         """Apply a random move for timeout. Must hold lock."""
         legal = list(game.board.legal_moves)
         if not legal:
             return
 
-        import random
         move = random.choice(legal)
         side = game.current_side()
         agent_id = game.current_agent_id()
@@ -440,11 +549,10 @@ class ArenaManager:
 
         if side == "white":
             game.white_fallbacks += 1
+            game.white_consecutive_timeouts += 1
         else:
             game.black_fallbacks += 1
-
-        if agent:
-            agent.fallbacks += 1
+            game.black_consecutive_timeouts += 1
 
         move_record = {
             "ply": len(game.moves),
@@ -457,10 +565,10 @@ class ArenaManager:
             "fen": game.board.fen(),
         }
         game.moves.append(move_record)
-        game.tool_calls_remaining = game.max_tool_calls
-        game.turn_deadline = time.time() + game.move_timeout
+        game.tool_calls_remaining = MAX_TOOL_CALLS
+        game.turn_deadline = time.time() + MOVE_TIMEOUT
 
-        self._broadcast({
+        await self._broadcast({
             "type": "move",
             "game_id": game.game_id,
             "ply": move_record["ply"],
@@ -474,14 +582,37 @@ class ArenaManager:
 
         log.warning("Timeout fallback for %s in game %s: %s", agent_name, game.game_id, san)
 
-        if game.board.is_game_over() or len(game.moves) >= 300:
-            self._finish_game(game)
+        abandoned_side = None
+        if game.white_consecutive_timeouts >= ABANDON_THRESHOLD:
+            abandoned_side = "white"
+        elif game.black_consecutive_timeouts >= ABANDON_THRESHOLD:
+            abandoned_side = "black"
 
-    def _finish_game(self, game: LiveGame) -> dict:
+        if abandoned_side:
+            log.warning("Agent %s abandoned game %s (%d consecutive timeouts)",
+                        agent_name, game.game_id, ABANDON_THRESHOLD)
+            game.result = "0-1" if abandoned_side == "white" else "1-0"
+            game.reason = "abandonment"
+            game.status = "finished"
+            await self._finish_game(game)
+        elif game.board.is_game_over() or len(game.moves) >= 300:
+            await self._finish_game(game)
+        else:
+            await self.db.update_game_move(
+                game.game_id, game.board.fen(), json.dumps(game.moves),
+                game.tool_calls_remaining, game.turn_deadline,
+                game.white_fallbacks, game.black_fallbacks,
+                game.white_consecutive_timeouts, game.black_consecutive_timeouts,
+            )
+
+    async def _finish_game(self, game: LiveGame) -> dict:
         """Finish a game and update ratings. Must hold lock."""
         board = game.board
 
-        if board.is_checkmate():
+        if game.reason and game.result:
+            result = game.result
+            reason = game.reason
+        elif board.is_checkmate():
             result = "0-1" if board.turn == chess.WHITE else "1-0"
             reason = "checkmate"
         elif board.is_stalemate():
@@ -529,27 +660,19 @@ class ArenaManager:
 
             w.fallbacks += game.white_fallbacks
             b.fallbacks += game.black_fallbacks
-            self._save_agents()
 
-        game_record = {
-            "game_id": game.game_id,
-            "white": {"agent_id": game.white_id, "name": game.white_name},
-            "black": {"agent_id": game.black_id, "name": game.black_name},
-            "result": result,
-            "reason": reason,
-            "total_moves": len(game.moves),
-            "white_fallbacks": game.white_fallbacks,
-            "black_fallbacks": game.black_fallbacks,
-            "moves": [
-                {"san": m["san"], "uci": m["uci"], "side": m["side"],
-                 "agent": m["agent"], "fallback": m.get("fallback", False), "fen": m["fen"]}
-                for m in game.moves
-            ],
-        }
-        self.finished_games.append(game_record)
-        self._save_games()
+            await self.db.update_agent_stats(
+                w.agent_id, w.elo, w.games_played, w.wins, w.draws, w.losses, w.fallbacks)
+            await self.db.update_agent_stats(
+                b.agent_id, b.elo, b.games_played, b.wins, b.draws, b.losses, b.fallbacks)
 
-        self._broadcast({
+        moves_json = json.dumps(game.moves)
+        await self.db.finish_game(
+            game.game_id, result, reason, board.fen(), moves_json,
+            game.white_fallbacks, game.black_fallbacks,
+        )
+
+        game_end_event = {
             "type": "game_end",
             "game_id": game.game_id,
             "result": result,
@@ -557,10 +680,18 @@ class ArenaManager:
             "white": game.white_name,
             "black": game.black_name,
             "total_moves": len(game.moves),
-        })
+        }
+        await self._broadcast(game_end_event)
+
+        for pid in (game.white_id, game.black_id):
+            await self._notify_agent(pid, {
+                "type": "game_end",
+                "game_id": game.game_id,
+                "result": result,
+                "reason": reason,
+            })
 
         del self.games[game.game_id]
-
         log.info("Game %s finished: %s (%s)", game.game_id, result, reason)
 
         return {
@@ -570,39 +701,66 @@ class ArenaManager:
             "fen": board.fen(),
         }
 
-    # -- Timeout monitor --
+    # -- Timeout monitor (async) --
 
-    def _start_timeout_monitor(self):
-        def _monitor():
-            while self._running:
-                time.sleep(5)
-                with self.lock:
-                    now = time.time()
-                    for game in list(self.games.values()):
-                        if game.status == "active" and now > game.turn_deadline:
-                            self._apply_timeout_move(game)
+    async def _timeout_monitor(self):
+        while self._running:
+            await asyncio.sleep(5)
+            async with self.lock:
+                now = time.time()
+                for game in list(self.games.values()):
+                    if game.status == "active" and now > game.turn_deadline:
+                        await self._apply_timeout_move(game)
 
-        self._timeout_thread = threading.Thread(target=_monitor, daemon=True)
-        self._timeout_thread.start()
-
-    def shutdown(self):
+    async def shutdown(self):
         self._running = False
+        if self._timeout_task:
+            self._timeout_task.cancel()
+            try:
+                await self._timeout_task
+            except asyncio.CancelledError:
+                pass
 
     # -- Game listing --
 
     def get_active_games(self) -> list[dict]:
         return [g.to_public() for g in self.games.values() if g.status == "active"]
 
-    def get_finished_games(self) -> list[dict]:
-        return list(reversed(self.finished_games[-50:]))
+    async def get_finished_games(self) -> list[dict]:
+        rows = await self.db.get_finished_games(limit=50)
+        return [self._finished_game_to_public(r) for r in rows]
 
     def get_my_games(self, agent_id: str) -> list[dict]:
-        active = [
+        return [
             g.to_state(agent_id)
             for g in self.games.values()
             if g.status == "active" and agent_id in (g.white_id, g.black_id)
         ]
-        return active
 
-    def get_all_games_history(self) -> list[dict]:
-        return self.finished_games
+    async def get_all_games_history(self) -> list[dict]:
+        rows = await self.db.get_finished_games(limit=200)
+        return [self._finished_game_to_public(r) for r in rows]
+
+    async def count_finished_games(self) -> int:
+        return await self.db.count_finished_games()
+
+    def _finished_game_to_public(self, row: dict) -> dict:
+        moves = json.loads(row["moves_json"]) if row.get("moves_json") else []
+        return {
+            "game_id": row["game_id"],
+            "white": {"agent_id": row["white_id"], "name": row["white_name"]},
+            "black": {"agent_id": row["black_id"], "name": row["black_name"]},
+            "status": row["status"],
+            "result": row["result"],
+            "reason": row["reason"],
+            "fen": row["fen"],
+            "total_moves": len(moves),
+            "white_fallbacks": row.get("white_fallbacks", 0),
+            "black_fallbacks": row.get("black_fallbacks", 0),
+            "moves": [
+                {"san": m["san"], "uci": m["uci"], "side": m["side"],
+                 "agent": m["agent"], "fallback": m.get("fallback", False),
+                 "fen": m.get("fen", "")}
+                for m in moves
+            ],
+        }

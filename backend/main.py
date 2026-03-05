@@ -3,15 +3,16 @@
 import asyncio
 import json
 import logging
-import threading
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from database import Database
 from arena import ArenaManager
 from tools import TOOL_DEFS
 
@@ -26,15 +27,28 @@ log = logging.getLogger(__name__)
 # State
 # ---------------------------------------------------------------------------
 
-connected_clients: list[WebSocket] = []
-main_loop: Optional[asyncio.AbstractEventLoop] = None
-arena = ArenaManager()
+spectator_clients: list[WebSocket] = []
+db = Database()
+arena = ArenaManager(db)
+
 
 # ---------------------------------------------------------------------------
-# App
+# App lifecycle
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="LLM Chess Arena", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    await arena.initialize()
+    arena.set_broadcast(broadcast_to_spectators)
+    log.info("Arena server started")
+    yield
+    await arena.shutdown()
+    await db.close()
+    log.info("Arena server stopped")
+
+
+app = FastAPI(title="LLM Chess Arena", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,41 +59,23 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Broadcast
+# Broadcast to spectator WebSockets
 # ---------------------------------------------------------------------------
 
-async def broadcast(event: dict):
+async def broadcast_to_spectators(event: dict):
     data = json.dumps(event)
     disconnected = []
-    for ws in connected_clients:
+    for ws in spectator_clients:
         try:
             await ws.send_text(data)
         except Exception:
             disconnected.append(ws)
     for ws in disconnected:
-        connected_clients.remove(ws)
-
-
-def sync_broadcast(event: dict):
-    if main_loop is None or main_loop.is_closed():
-        return
-    asyncio.run_coroutine_threadsafe(broadcast(event), main_loop)
-
-
-@app.on_event("startup")
-async def startup():
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    arena.set_broadcast(sync_broadcast)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    arena.shutdown()
+        spectator_clients.remove(ws)
 
 
 # ---------------------------------------------------------------------------
-# Auth helper
+# Auth + rate limit helpers
 # ---------------------------------------------------------------------------
 
 def _auth(authorization: Optional[str]) -> str:
@@ -90,6 +86,13 @@ def _auth(authorization: Optional[str]) -> str:
     if not agent_id:
         raise HTTPException(401, "Invalid token")
     return agent_id
+
+
+def _rate_check(request: Request, key: str, max_req: int, window: float):
+    ip = request.client.host if request.client else "unknown"
+    full_key = f"{key}:{ip}"
+    if not arena.rate_limiter.check(full_key, max_req, window):
+        raise HTTPException(429, "Rate limit exceeded. Please slow down.")
 
 
 # ---------------------------------------------------------------------------
@@ -113,48 +116,45 @@ class ToolRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/leaderboard")
-def get_leaderboard():
+async def get_leaderboard():
     return arena.get_leaderboard()
 
 
 @app.get("/api/standings")
-def get_standings():
-    """Alias for leaderboard (backward compatible)."""
+async def get_standings():
     return arena.get_leaderboard()
 
 
 @app.get("/api/games/active")
-def get_active_games():
+async def get_active_games():
     return arena.get_active_games()
 
 
 @app.get("/api/games/finished")
-def get_finished_games():
-    return arena.get_finished_games()
+async def get_finished_games():
+    return await arena.get_finished_games()
 
 
 @app.get("/api/games")
-def get_all_games():
-    """All finished games (backward compatible)."""
-    return arena.get_all_games_history()
+async def get_all_games():
+    return await arena.get_all_games_history()
 
 
 @app.get("/api/games/{game_id}")
-def get_game(game_id: str):
-    g = arena.get_game_public(game_id)
+async def get_game(game_id: str):
+    g = await arena.get_game_public_or_finished(game_id)
     if not g:
         raise HTTPException(404, "Game not found")
     return g
 
 
 @app.get("/api/queue/status")
-def get_queue_status():
+async def get_queue_status():
     return arena.get_queue_status()
 
 
 @app.get("/api/tools")
-def list_tools():
-    """List available chess analysis tools that agents can use."""
+async def list_tools():
     return [
         {"name": t["name"], "description": t["description"], "parameters": t["params"]}
         for t in TOOL_DEFS
@@ -163,20 +163,20 @@ def list_tools():
 
 
 @app.get("/api/status")
-def get_status():
+async def get_status():
     active = arena.get_active_games()
+    total_finished = await arena.count_finished_games()
     return {
         "running": len(active) > 0,
         "active_games": len(active),
         "queue_size": len(arena.queue),
         "total_agents": len(arena.agents),
-        "total_games_played": len(arena.finished_games),
+        "total_games_played": total_finished,
     }
 
 
 @app.get("/api/agents")
-def get_agents():
-    """List all registered agents (public info)."""
+async def get_agents():
     return [a.to_public() for a in sorted(arena.agents.values(), key=lambda a: -a.elo)]
 
 
@@ -185,38 +185,39 @@ def get_agents():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/agents/register")
-def register_agent(req: RegisterRequest):
+async def register_agent(req: RegisterRequest, request: Request):
+    _rate_check(request, "register", 5, 3600)
     if not req.name or len(req.name.strip()) < 2:
         raise HTTPException(400, "Name must be at least 2 characters")
     if len(req.name) > 30:
         raise HTTPException(400, "Name must be 30 characters or less")
-    result = arena.register_agent(req.name.strip(), req.description.strip())
+    result = await arena.register_agent(req.name.strip(), req.description.strip())
     if "error" in result:
         raise HTTPException(409, result["error"])
     return result
 
 
 @app.post("/api/queue/join")
-def join_queue(authorization: Optional[str] = Header(None)):
+async def join_queue(request: Request, authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
-    result = arena.join_queue(agent_id)
-    return result
+    _rate_check(request, f"queue:{agent_id}", 10, 60)
+    return await arena.join_queue(agent_id)
 
 
 @app.post("/api/queue/leave")
-def leave_queue(authorization: Optional[str] = Header(None)):
+async def leave_queue(authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
-    return arena.leave_queue(agent_id)
+    return await arena.leave_queue(agent_id)
 
 
 @app.get("/api/my/games")
-def my_games(authorization: Optional[str] = Header(None)):
+async def my_games(authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
     return arena.get_my_games(agent_id)
 
 
 @app.get("/api/my/agent")
-def my_agent(authorization: Optional[str] = Header(None)):
+async def my_agent(authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
     agent = arena.get_agent(agent_id)
     if not agent:
@@ -225,25 +226,25 @@ def my_agent(authorization: Optional[str] = Header(None)):
 
 
 @app.get("/api/games/{game_id}/state")
-def get_game_state(game_id: str, authorization: Optional[str] = Header(None)):
+async def get_game_state(game_id: str, authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
-    state = arena.get_game_state(game_id, agent_id)
+    state = await arena.get_game_state_or_finished(game_id, agent_id)
     if not state:
         raise HTTPException(404, "Game not found")
     return state
 
 
 @app.post("/api/games/{game_id}/move")
-def submit_move(game_id: str, req: MoveRequest, authorization: Optional[str] = Header(None)):
+async def submit_move(game_id: str, req: MoveRequest, authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
-    result = arena.make_move(game_id, agent_id, req.uci)
+    result = await arena.make_move(game_id, agent_id, req.uci)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
 
 
 @app.post("/api/games/{game_id}/tool")
-def use_tool(game_id: str, req: ToolRequest, authorization: Optional[str] = Header(None)):
+async def use_tool(game_id: str, req: ToolRequest, authorization: Optional[str] = Header(None)):
     agent_id = _auth(authorization)
     if req.tool == "make_move":
         raise HTTPException(400, "Use POST /api/games/{game_id}/move to submit moves")
@@ -254,20 +255,48 @@ def use_tool(game_id: str, req: ToolRequest, authorization: Optional[str] = Head
 
 
 # ---------------------------------------------------------------------------
-# WebSocket for live spectating
+# WebSocket: spectator (live game watching)
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_spectator(ws: WebSocket):
     await ws.accept()
-    connected_clients.append(ws)
-    log.info("WebSocket connected — %d client(s)", len(connected_clients))
+    spectator_clients.append(ws)
+    log.info("Spectator connected — %d client(s)", len(spectator_clients))
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        connected_clients.remove(ws)
-        log.info("WebSocket disconnected — %d client(s)", len(connected_clients))
+        spectator_clients.remove(ws)
+        log.info("Spectator disconnected — %d client(s)", len(spectator_clients))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: agent (real-time game events for playing agents)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/agent")
+async def websocket_agent(ws: WebSocket, token: str = ""):
+    if not token:
+        await ws.close(code=4001, reason="Missing token query parameter")
+        return
+    agent_id = arena.authenticate(token)
+    if not agent_id:
+        await ws.close(code=4001, reason="Invalid token")
+        return
+
+    await ws.accept()
+    arena.register_agent_ws(agent_id, ws)
+    agent = arena.get_agent(agent_id)
+    agent_name = agent.name if agent else agent_id
+    log.info("Agent WS connected: %s (%s)", agent_name, agent_id)
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        arena.unregister_agent_ws(agent_id, ws)
+        log.info("Agent WS disconnected: %s (%s)", agent_name, agent_id)
 
 
 # ---------------------------------------------------------------------------

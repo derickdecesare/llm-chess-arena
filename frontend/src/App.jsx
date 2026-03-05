@@ -35,6 +35,10 @@ export default function App() {
 
   const [arenaStatus, setArenaStatus] = useState({})
   const wsRef = useRef(null)
+  const selectedGameIdRef = useRef(null)
+
+  // Keep ref in sync with state so the WS callback always sees the latest value
+  useEffect(() => { selectedGameIdRef.current = selectedGameId }, [selectedGameId])
 
   const refreshData = useCallback(() => {
     fetchStandings().then(setStandings)
@@ -45,8 +49,9 @@ export default function App() {
   }, [])
 
   const handleWsMessage = useCallback((event) => {
+    const selId = selectedGameIdRef.current
     if (event.type === 'move') {
-      if (!selectedGameId || event.game_id === selectedGameId) {
+      if (!selId || event.game_id === selId) {
         setCurrentFen(event.fen)
         setLastMove({ from: event.uci.slice(0, 2), to: event.uci.slice(2, 4) })
         setMoves((prev) => [...prev, {
@@ -63,7 +68,7 @@ export default function App() {
     } else if (event.type === 'game_start') {
       fetchActiveGames().then(setActiveGames)
       fetchQueueStatus().then(setQueueStatus)
-      if (!selectedGameId) {
+      if (!selId) {
         setSelectedGameId(event.game_id)
         setMoves([])
         setCurrentFen('start')
@@ -74,20 +79,18 @@ export default function App() {
         setReplayMode(false)
       }
     } else if (event.type === 'game_end') {
-      if (!selectedGameId || event.game_id === selectedGameId) {
+      if (!selId || event.game_id === selId) {
         setGameResult(event.result)
       }
       fetchStandings().then(setStandings)
       fetchGames().then(setFinishedGames)
       fetchActiveGames().then(setActiveGames)
-    } else if (event.type === 'tournament_complete') {
-      refreshData()
     }
-  }, [selectedGameId, refreshData])
+  }, [])
 
   useEffect(() => {
     refreshData()
-    const interval = setInterval(refreshData, 10000)
+    const interval = setInterval(refreshData, 30000)
     wsRef.current = connectWebSocket(handleWsMessage)
     return () => {
       clearInterval(interval)

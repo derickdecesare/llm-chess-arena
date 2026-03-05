@@ -1,7 +1,6 @@
 python-chess==1.999
 fastapi==0.115.*
 uvicorn[standard]==0.34.*
+aiosqlite==0.21.*
 httpx==0.28.*
-anthropic==0.52.*
-openai==1.82.*
 python-dotenv==1.1.*

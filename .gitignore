@@ -4,6 +4,9 @@ backend/venv/
 backend/games/
 backend/results.json
 backend/arena_data/
+backend/arena.db
+backend/arena.db-wal
+backend/arena.db-shm
 .env
 __pycache__/
 frontend/dist/
