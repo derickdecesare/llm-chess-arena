@@ -1,18 +1,20 @@
-"""FastAPI server for LLM Chess Arena."""
+"""FastAPI server for LLM Chess Arena — public multi-agent edition."""
 
 import asyncio
 import json
 import logging
-import threading
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from agents import DEFAULT_AGENTS, AgentConfig
-from tournament import Tournament
-from game import GameResult
+from database import Database
+from arena import ArenaManager
+from tools import TOOL_DEFS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,60 +27,28 @@ log = logging.getLogger(__name__)
 # State
 # ---------------------------------------------------------------------------
 
-connected_clients: list[WebSocket] = []
-tournament_running = False
-tournament_pause_event = threading.Event()  # set = running, clear = paused
-tournament_pause_event.set()
-main_loop: Optional[asyncio.AbstractEventLoop] = None
-
-
-def _load_or_create_arena() -> Tournament:
-    """Load previous tournament state from results.json, or create fresh."""
-    t = Tournament(agents=DEFAULT_AGENTS)
-    results_file = Path(__file__).parent / "results.json"
-    if results_file.exists():
-        try:
-            data = json.loads(results_file.read_text())
-            t.games = data.get("games", [])
-            for g in t.games:
-                name_w, name_b = g["white"], g["black"]
-                sw = t.standings[name_w]
-                sb = t.standings[name_b]
-                sw.played += 1
-                sb.played += 1
-                if g["result"] == "1-0":
-                    sw.wins += 1
-                    sw.points += 1.0
-                    sb.losses += 1
-                elif g["result"] == "0-1":
-                    sb.wins += 1
-                    sb.points += 1.0
-                    sw.losses += 1
-                else:
-                    sw.draws += 1
-                    sw.points += 0.5
-                    sb.draws += 1
-                    sb.points += 0.5
-                sw.total_fallbacks += sum(
-                    1 for m in g.get("moves", []) if m.get("fallback") and m.get("side") == "white"
-                )
-                sb.total_fallbacks += sum(
-                    1 for m in g.get("moves", []) if m.get("fallback") and m.get("side") == "black"
-                )
-            log.info("Loaded %d games from results.json", len(t.games))
-        except Exception:
-            log.exception("Failed to load results.json — starting fresh")
-    return t
-
-
-arena: Tournament = _load_or_create_arena()
+spectator_clients: list[WebSocket] = []
+db = Database()
+arena = ArenaManager(db)
 
 
 # ---------------------------------------------------------------------------
-# App
+# App lifecycle
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="LLM Chess Arena")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    await arena.initialize()
+    arena.set_broadcast(broadcast_to_spectators)
+    log.info("Arena server started")
+    yield
+    await arena.shutdown()
+    await db.close()
+    log.info("Arena server stopped")
+
+
+app = FastAPI(title="LLM Chess Arena", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,228 +59,253 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Broadcast helpers
+# Broadcast to spectator WebSockets
 # ---------------------------------------------------------------------------
 
-async def broadcast(event: dict):
-    """Send event to all connected WebSocket clients."""
+async def broadcast_to_spectators(event: dict):
     data = json.dumps(event)
     disconnected = []
-    for ws in connected_clients:
+    for ws in spectator_clients:
         try:
             await ws.send_text(data)
         except Exception:
             disconnected.append(ws)
     for ws in disconnected:
-        connected_clients.remove(ws)
-
-
-def sync_broadcast(event: dict):
-    """Thread-safe broadcast: schedule onto the main event loop."""
-    if main_loop is None or main_loop.is_closed():
-        log.warning("sync_broadcast: no event loop available, dropping event")
-        return
-    asyncio.run_coroutine_threadsafe(broadcast(event), main_loop)
+        spectator_clients.remove(ws)
 
 
 # ---------------------------------------------------------------------------
-# REST endpoints
+# Auth + rate limit helpers
 # ---------------------------------------------------------------------------
 
-AGENT_INFO = {a.name: {"provider": a.provider, "model": a.model, "thinking": a.thinking} for a in DEFAULT_AGENTS}
+def _auth(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(401, "Missing Authorization header. Use: Bearer <your-token>")
+    token = authorization.replace("Bearer ", "").strip()
+    agent_id = arena.authenticate(token)
+    if not agent_id:
+        raise HTTPException(401, "Invalid token")
+    return agent_id
 
 
-@app.get("/api/agents")
-def get_agents():
-    return [
-        {"name": a.name, "provider": a.provider, "model": a.model, "personality_file": a.personality_file, "thinking": a.thinking}
-        for a in DEFAULT_AGENTS
-    ]
+def _rate_check(request: Request, key: str, max_req: int, window: float):
+    ip = request.client.host if request.client else "unknown"
+    full_key = f"{key}:{ip}"
+    if not arena.rate_limiter.check(full_key, max_req, window):
+        raise HTTPException(429, "Rate limit exceeded. Please slow down.")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class RegisterRequest(BaseModel):
+    name: str
+    description: str = ""
+
+class MoveRequest(BaseModel):
+    uci: str
+
+class ToolRequest(BaseModel):
+    tool: str
+    args: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC endpoints (no auth)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/leaderboard")
+async def get_leaderboard():
+    return arena.get_leaderboard()
 
 
 @app.get("/api/standings")
-def get_standings():
-    if arena is None:
-        return []
-    standings = arena.get_standings()
-    for s in standings:
-        info = AGENT_INFO.get(s["name"], {})
-        s["model"] = info.get("model", "")
-        s["provider"] = info.get("provider", "")
-        s["thinking"] = info.get("thinking", False)
-    return standings
+async def get_standings():
+    return arena.get_leaderboard()
+
+
+@app.get("/api/games/active")
+async def get_active_games():
+    return arena.get_active_games()
+
+
+@app.get("/api/games/finished")
+async def get_finished_games():
+    return await arena.get_finished_games()
 
 
 @app.get("/api/games")
-def get_games():
-    if arena is None:
-        return []
-    return arena.games
+async def get_all_games():
+    return await arena.get_all_games_history()
 
 
-@app.get("/api/games/{game_num}/pgn")
-def get_game_pgn(game_num: int):
-    games_dir = Path(__file__).parent / "games"
-    for f in games_dir.glob(f"game_{game_num:03d}_*.pgn"):
-        return {"pgn": f.read_text()}
-    return {"error": "Game not found"}
+@app.get("/api/games/{game_id}")
+async def get_game(game_id: str):
+    g = await arena.get_game_public_or_finished(game_id)
+    if not g:
+        raise HTTPException(404, "Game not found")
+    return g
+
+
+@app.get("/api/queue/status")
+async def get_queue_status():
+    return arena.get_queue_status()
+
+
+@app.get("/api/tools")
+async def list_tools():
+    return [
+        {"name": t["name"], "description": t["description"], "parameters": t["params"]}
+        for t in TOOL_DEFS
+        if t["name"] != "make_move"
+    ]
 
 
 @app.get("/api/status")
-def get_status():
+async def get_status():
+    active = arena.get_active_games()
+    total_finished = await arena.count_finished_games()
     return {
-        "running": tournament_running,
-        "paused": tournament_running and not tournament_pause_event.is_set(),
-        "current_game": arena.current_game if arena else None,
-        "total_games": len(arena.games) if arena else 0,
-        "has_previous": len(arena.games) > 0 if arena else False,
+        "running": len(active) > 0,
+        "active_games": len(active),
+        "queue_size": len(arena.queue),
+        "total_agents": len(arena.agents),
+        "total_games_played": total_finished,
     }
 
 
-@app.post("/api/tournament/start")
-async def start_tournament():
-    """Resume an incomplete tournament or start fresh if none exists."""
-    global arena, tournament_running, main_loop
-
-    if tournament_running:
-        log.warning("Tournament already running — ignoring start request")
-        return {"error": "Tournament already running"}
-
-    tournament_running = True
-    main_loop = asyncio.get_running_loop()
-
-    completed_games = len(arena.games)
-    total_pairings = len(arena.generate_pairings())
-    if completed_games > 0 and completed_games < total_pairings:
-        log.info("Resuming tournament — %d/%d games done", completed_games, total_pairings)
-    else:
-        log.info("Starting fresh tournament — %d pairings", total_pairings)
-
-    main_loop.run_in_executor(None, _run_tournament)
-
-    return {
-        "status": "resumed" if completed_games > 0 else "started",
-        "completed_games": completed_games,
-        "total_pairings": total_pairings,
-    }
-
-
-@app.post("/api/tournament/reset")
-async def reset_tournament():
-    """Delete all saved state and create a fresh tournament."""
-    global arena, tournament_running
-
-    if tournament_running:
-        return {"error": "Cannot reset while tournament is running"}
-
-    results_file = Path(__file__).parent / "results.json"
-    games_dir = Path(__file__).parent / "games"
-
-    if results_file.exists():
-        results_file.unlink()
-    if games_dir.exists():
-        for f in games_dir.glob("*.pgn"):
-            f.unlink()
-
-    arena = Tournament(agents=DEFAULT_AGENTS)
-    log.info("Tournament reset — all data cleared")
-
-    return {"status": "reset"}
-
-
-@app.post("/api/tournament/pause")
-async def pause_tournament():
-    if not tournament_running:
-        return {"error": "No tournament running"}
-
-    if tournament_pause_event.is_set():
-        tournament_pause_event.clear()
-        log.info("Tournament paused — will stop after current game")
-        sync_broadcast({"type": "tournament_paused"})
-        return {"status": "paused"}
-    else:
-        tournament_pause_event.set()
-        log.info("Tournament resumed")
-        sync_broadcast({"type": "tournament_resumed"})
-        return {"status": "resumed"}
-
-
-def _run_tournament():
-    global tournament_running
-
-    def on_move(record):
-        sync_broadcast({
-            "type": "move",
-            "ply": record.ply,
-            "side": record.side,
-            "agent": record.agent,
-            "uci": record.uci,
-            "san": record.san,
-            "fen": record.fen_after,
-            "fallback": record.fallback,
-            "attempts": record.attempts,
-        })
-
-    def on_game_start(num, total, white, black):
-        sync_broadcast({
-            "type": "game_start",
-            "game_num": num,
-            "total_games": total,
-            "white": white,
-            "black": black,
-        })
-
-    def on_game_end(game_record):
-        sync_broadcast({
-            "type": "game_end",
-            "game_num": game_record["game_num"],
-            "result": game_record["result"],
-            "reason": game_record["reason"],
-            "white": game_record["white"],
-            "black": game_record["black"],
-            "total_moves": game_record["total_moves"],
-            "standings": arena.get_standings(),
-        })
-
-    def on_between_games():
-        """Called between games — blocks while paused, returns False to stop."""
-        if not tournament_pause_event.is_set():
-            log.info("Tournament paused — waiting...")
-            tournament_pause_event.wait()
-            log.info("Tournament unpaused — continuing")
-        return tournament_running
-
-    try:
-        arena.run_full_tournament(
-            on_move=on_move,
-            on_game_start=on_game_start,
-            on_game_end=on_game_end,
-            on_between_games=on_between_games,
-        )
-        sync_broadcast({"type": "tournament_complete", "standings": arena.get_standings()})
-        log.info("Tournament finished — broadcasting final standings")
-    except Exception:
-        log.exception("Tournament crashed!")
-    finally:
-        tournament_running = False
-        tournament_pause_event.set()
+@app.get("/api/agents")
+async def get_agents():
+    return [a.to_public() for a in sorted(arena.agents.values(), key=lambda a: -a.elo)]
 
 
 # ---------------------------------------------------------------------------
-# WebSocket for live updates
+# AGENT endpoints (require auth)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/agents/register")
+async def register_agent(req: RegisterRequest, request: Request):
+    _rate_check(request, "register", 5, 3600)
+    if not req.name or len(req.name.strip()) < 2:
+        raise HTTPException(400, "Name must be at least 2 characters")
+    if len(req.name) > 30:
+        raise HTTPException(400, "Name must be 30 characters or less")
+    result = await arena.register_agent(req.name.strip(), req.description.strip())
+    if "error" in result:
+        raise HTTPException(409, result["error"])
+    return result
+
+
+@app.post("/api/queue/join")
+async def join_queue(request: Request, authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    _rate_check(request, f"queue:{agent_id}", 10, 60)
+    return await arena.join_queue(agent_id)
+
+
+@app.post("/api/queue/leave")
+async def leave_queue(authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    return await arena.leave_queue(agent_id)
+
+
+@app.get("/api/my/games")
+async def my_games(authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    return arena.get_my_games(agent_id)
+
+
+@app.get("/api/my/agent")
+async def my_agent(authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    agent = arena.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return agent.to_public()
+
+
+@app.get("/api/games/{game_id}/state")
+async def get_game_state(game_id: str, authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    state = await arena.get_game_state_or_finished(game_id, agent_id)
+    if not state:
+        raise HTTPException(404, "Game not found")
+    return state
+
+
+@app.post("/api/games/{game_id}/move")
+async def submit_move(game_id: str, req: MoveRequest, authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    result = await arena.make_move(game_id, agent_id, req.uci)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/api/games/{game_id}/tool")
+async def use_tool(game_id: str, req: ToolRequest, authorization: Optional[str] = Header(None)):
+    agent_id = _auth(authorization)
+    if req.tool == "make_move":
+        raise HTTPException(400, "Use POST /api/games/{game_id}/move to submit moves")
+    result = arena.use_tool(game_id, agent_id, req.tool, req.args)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: spectator (live game watching)
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_spectator(ws: WebSocket):
     await ws.accept()
-    connected_clients.append(ws)
-    log.info("WebSocket connected — %d client(s)", len(connected_clients))
+    spectator_clients.append(ws)
+    log.info("Spectator connected — %d client(s)", len(spectator_clients))
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        connected_clients.remove(ws)
-        log.info("WebSocket disconnected — %d client(s)", len(connected_clients))
+        spectator_clients.remove(ws)
+        log.info("Spectator disconnected — %d client(s)", len(spectator_clients))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: agent (real-time game events for playing agents)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/agent")
+async def websocket_agent(ws: WebSocket, token: str = ""):
+    if not token:
+        await ws.close(code=4001, reason="Missing token query parameter")
+        return
+    agent_id = arena.authenticate(token)
+    if not agent_id:
+        await ws.close(code=4001, reason="Invalid token")
+        return
+
+    await ws.accept()
+    arena.register_agent_ws(agent_id, ws)
+    agent = arena.get_agent(agent_id)
+    agent_name = agent.name if agent else agent_id
+    log.info("Agent WS connected: %s (%s)", agent_name, agent_id)
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        arena.unregister_agent_ws(agent_id, ws)
+        log.info("Agent WS disconnected: %s (%s)", agent_name, agent_id)
+
+
+# ---------------------------------------------------------------------------
+# Serve frontend build (production)
+# ---------------------------------------------------------------------------
+
+frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="static")
 
 
 # ---------------------------------------------------------------------------
