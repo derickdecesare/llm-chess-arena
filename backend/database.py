@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -81,16 +82,35 @@ class Database:
             await self.db.close()
             log.info("Database closed")
 
+    @asynccontextmanager
+    async def transaction(self):
+        """Context manager for explicit transactions.
+
+        Groups multiple writes into a single atomic commit. Usage:
+
+            async with db.transaction():
+                await db.update_agent_stats(..., _commit=False)
+                await db.finish_game(..., _commit=False)
+        """
+        await self.db.execute("BEGIN")
+        try:
+            yield
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+
     # -- Agents --
 
     async def insert_agent(self, agent_id: str, name: str, description: str,
-                           token_hash: str, created_at: float):
+                           token_hash: str, created_at: float, *, _commit: bool = True):
         await self.db.execute(
             "INSERT INTO agents (agent_id, name, description, token_hash, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (agent_id, name, description, token_hash, created_at),
         )
-        await self.db.commit()
+        if _commit:
+            await self.db.commit()
 
     async def get_agent_by_token_hash(self, token_hash: str) -> Optional[dict]:
         cursor = await self.db.execute(
@@ -121,19 +141,20 @@ class Database:
 
     async def update_agent_stats(self, agent_id: str, elo: float,
                                  games_played: int, wins: int, draws: int,
-                                 losses: int, fallbacks: int):
+                                 losses: int, fallbacks: int, *, _commit: bool = True):
         await self.db.execute(
             "UPDATE agents SET elo=?, games_played=?, wins=?, draws=?, "
             "losses=?, fallbacks=? WHERE agent_id=?",
             (elo, games_played, wins, draws, losses, fallbacks, agent_id),
         )
-        await self.db.commit()
+        if _commit:
+            await self.db.commit()
 
     # -- Games --
 
     async def insert_game(self, game_id: str, white_id: str, black_id: str,
                           white_name: str, black_name: str, fen: str,
-                          turn_deadline: float, created_at: float):
+                          turn_deadline: float, created_at: float, *, _commit: bool = True):
         await self.db.execute(
             "INSERT INTO games (game_id, white_id, black_id, white_name, "
             "black_name, fen, turn_deadline, created_at) "
@@ -141,13 +162,14 @@ class Database:
             (game_id, white_id, black_id, white_name, black_name, fen,
              turn_deadline, created_at),
         )
-        await self.db.commit()
+        if _commit:
+            await self.db.commit()
 
     async def update_game_move(self, game_id: str, fen: str, moves_json: str,
                                tool_calls_remaining: int, turn_deadline: float,
                                white_fallbacks: int, black_fallbacks: int,
                                white_consecutive_timeouts: int,
-                               black_consecutive_timeouts: int):
+                               black_consecutive_timeouts: int, *, _commit: bool = True):
         await self.db.execute(
             "UPDATE games SET fen=?, moves_json=?, tool_calls_remaining=?, "
             "turn_deadline=?, white_fallbacks=?, black_fallbacks=?, "
@@ -157,11 +179,12 @@ class Database:
              white_fallbacks, black_fallbacks,
              white_consecutive_timeouts, black_consecutive_timeouts, game_id),
         )
-        await self.db.commit()
+        if _commit:
+            await self.db.commit()
 
     async def finish_game(self, game_id: str, result: str, reason: str,
                           fen: str, moves_json: str,
-                          white_fallbacks: int, black_fallbacks: int):
+                          white_fallbacks: int, black_fallbacks: int, *, _commit: bool = True):
         await self.db.execute(
             "UPDATE games SET status='finished', result=?, reason=?, fen=?, "
             "moves_json=?, white_fallbacks=?, black_fallbacks=?, "
@@ -169,7 +192,8 @@ class Database:
             (result, reason, fen, moves_json, white_fallbacks, black_fallbacks,
              time.time(), game_id),
         )
-        await self.db.commit()
+        if _commit:
+            await self.db.commit()
 
     async def get_active_games(self) -> list[dict]:
         cursor = await self.db.execute(

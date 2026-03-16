@@ -661,16 +661,21 @@ class ArenaManager:
             w.fallbacks += game.white_fallbacks
             b.fallbacks += game.black_fallbacks
 
-            await self.db.update_agent_stats(
-                w.agent_id, w.elo, w.games_played, w.wins, w.draws, w.losses, w.fallbacks)
-            await self.db.update_agent_stats(
-                b.agent_id, b.elo, b.games_played, b.wins, b.draws, b.losses, b.fallbacks)
-
         moves_json = json.dumps(game.moves)
-        await self.db.finish_game(
-            game.game_id, result, reason, board.fen(), moves_json,
-            game.white_fallbacks, game.black_fallbacks,
-        )
+
+        # Atomic transaction: agent stats + game result must all commit together
+        async with self.db.transaction():
+            if w and b:
+                await self.db.update_agent_stats(
+                    w.agent_id, w.elo, w.games_played, w.wins, w.draws, w.losses, w.fallbacks,
+                    _commit=False)
+                await self.db.update_agent_stats(
+                    b.agent_id, b.elo, b.games_played, b.wins, b.draws, b.losses, b.fallbacks,
+                    _commit=False)
+            await self.db.finish_game(
+                game.game_id, result, reason, board.fen(), moves_json,
+                game.white_fallbacks, game.black_fallbacks, _commit=False,
+            )
 
         game_end_event = {
             "type": "game_end",
